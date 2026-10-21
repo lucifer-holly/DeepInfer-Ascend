@@ -2,16 +2,43 @@
 
 > 让 [DeepInfer](https://github.com/deepseek-ai/DeepInfer) 支持**昇腾 950 以外的昇腾加速卡**。
 
-上游 DeepInfer 的昇腾后端是围绕**昇腾 950**（`NpuArch=3510`）构建的：
-从 kernel DSL、GEMM 库、通信库到数值格式，每一层都假定 950 的能力集，
+上游 DeepInfer 的昇腾后端是围绕**昇腾 950**（`NpuArch=3510`）构建的 ——
+kernel DSL、GEMM 库、通信库、注意力库、数值格式、互联协议，每一层都假定 950 的能力集。
 README 写明的硬件支持是 "NVIDIA SM100 GPUs / Huawei Ascend 950 NPUs"，
 依赖是 CANN 9.2 + `torch-npu 2.13`。
 
-而昇腾在用的卡远不止 950。本仓库的目标是把「昇腾」这一层从「950」里拆出来，
-让同一套引擎能落到 **A2（910B 系列）/ A3（910C、`Ascend910_93`）** 以及后续型号上。
+而昇腾在用的卡远不止 950。本仓库把「昇腾」这一层从「950」里拆出来，
+让同一套引擎能落到 **A2（910B 系列）/ A3（910C、`Ascend910_93`）** 及后续型号上。
 
-> **状态：bring-up 与可行性验证阶段，尚不能用于推理。**
-> 当前第一目标是 **910C（A3 / `NpuArch=2201`）**。
+> **状态：bring-up 与可行性验证完成，尚不能用于推理。**
+> 当前第一目标是 **910C（A3 / `NpuArch=2201`）**，实测平台 `Ascend910_9382`。
+
+## 结论速览
+
+**引擎层能跑，模型层不能。** 这是本轮最重要的结果：
+
+| 层 | A2/A3 上 | 障碍 |
+|---|---|---|
+| C++ 扩展 `deepinfer._C` | ✅ 编译通过 | 镜像只有 GCC 11，`<format>` 要 GCC 13 |
+| Python 完整模块图 | ✅ import 通过 | 四个 vendor 包顶层硬 import |
+| 引擎运行时（调度器 / worker / tokenizer / 多模态子进程） | ✅ 启动 | torch 2.13 专有的两个 API |
+| 模型模块构造 | ❌ | **FP8 —— 硬件层面就没有** |
+| kernel 层（30 个 tilelang 算子） | ❌ | **VF 编程模型 arch 2201 不支持** |
+
+两个硬障碍都有来自华为自己的证据，不是推测：
+
+- **FP8 缺失**有四重独立证据（CANN 头文件门控、mmad dtype 表、加速形状表、
+  以及运行时连 `torch.zeros` 一个 FP8 张量都报 `aclnnInplaceZero` 失败）
+- **tilelang** 在 CANN 9.2 下对 `dav-3510` 两种模式都编得过、对 `dav-2201` 两种都编不过，
+  诊断原文是 `__simd_vf__/__simt_vf__ is not supported on current architecture`
+
+详见 **[docs/findings.md](docs/findings.md)**（每条都附可复核的手段）。
+
+## 这不是「加个新硬件」的问题
+
+`get_bf16_tflops_limit()` 对所有昇腾硬编码 `432`，而 432 只是 950 的 **32 核 @ 1650 MHz**
+那一支；同代系内 28 核是 378、36 核是 530。**上游这个常量在 950 上就已经不准。**
+已向上游提交修复：[deepseek-ai/DeepInfer#170](https://github.com/deepseek-ai/DeepInfer/pull/170)。
 
 ## 设计原则
 
@@ -19,137 +46,78 @@ README 写明的硬件支持是 "NVIDIA SM100 GPUs / Huawei Ascend 950 NPUs"，
    要加的是 **ascend 内部的 soc 维度** —— 上游 `PlatformEnum` 目前只有 `GPU`/`NPU`，
    没有芯片粒度，这是扩展点。
 2. **型号参数从 CANN 读，不写死。** 核数、UB 容量、峰值算力都在
-   `$ASCEND_HOME/aarch64-linux/data/platform_config/<SoC>.ini` 里，
-   运行时可查。上游把 950 的数值硬编码进了代码（见下）。
-3. **能力按特性判断，不按型号判断。** 「有没有原生 FP8」比「是不是 910C」更稳定，
+   `$ASCEND_HOME_PATH/*-linux/data/platform_config/<SoC>.ini` 里，运行时可查。
+3. **按特性判断而非按型号判断。** 「有没有原生 FP8」比「是不是 910C」稳定，
    新卡出来不用再改一遍。
 4. **通用修正回上游，型号专有实现留本仓库。**
 
-## 昇腾各代的关键差异
-
-| | A2 / A3（910B、910C） | 950PR |
-|---|---|---|
-| `NpuArch` | **2201** | 3510 |
-| `--npu-arch`（bisheng） | `dav-2201` | `dav-3510` |
-| `CCEC_*_version`（另一套命名） | `dav-c220-cube` / `dav-c220-vec` | `dav-c310-cube` / `dav-c310-vec` |
-| 原生 FP8 / MXFP8 / MXFP4 | ❌ | ✅ |
-| 低精度加速路径 | INT8 / INT4 / INT2 | FP8 / FP4 |
-| Cube 核 × 频率（910C 实测） | 24 × 1800 MHz | 32 × 1650 MHz |
-| Unified Buffer | 192 KiB | 248 KiB |
-| L2 | 192 MiB | 128 MiB |
-
-⚠️ **两套 arch 命名不能混用。** `platform_config` 里写的是 CCEC 版本（`dav-c220-cube`），
-而编译器 `--npu-arch` 要的是数字命名（`dav-2201`）。传错会得到
-`bisheng: error: Unsupported NPU architecture or soc`。
-
-## FP8 缺失：来自 CANN 自身的三重证据
-
-这是 950 与其他昇腾代系最根本的分界，也是移植 DeepInfer 的核心障碍。
-
-1. **头文件门控** —— `asc/include/simt_api/asc_fp8.h`：
-   ```c
-   #if (__NPU_ARCH__ == 3510) || (__NPU_ARCH__ == 5102)
-   ```
-   不含 2201。
-2. **mmad 的 dtype 表** —— `Ascend910_9382.ini` 的 `[AICoreintrinsicDtypeMap]`：
-   ```
-   25=Intrinsic_mmad|u32u8u8,s32s8s8,s32u8s8,f16f16f16,f32f16f16,f16f16u2,
-                     u8,s8,f162f16,f162f32,f16u2,u8s8,h322f32,f32f32f32,f322f32
-   ```
-   无任何 fp8 / e4m3 / e2m1 项。
-3. **加速形状表** —— 同文件 `[DtypeMKN]` 只为 `DT_INT8`(16,32,16)、`DT_INT4`(16,64,16)、
-   `DT_INT2`、`DT_UINT1` 提供加速形状，**没有 FP8/FP4 条目**。
-
-而 DeepInfer 目前唯一支持的模型 `DeepSeek-V4.1-Flash` 的权重即
-`{"quant_method":"fp8","weight_block_size":[32,32],"scale_fmt":"ue8m0","expert_dtype":"fp4"}`，
-KV cache 的全部五种格式都是 `e4m3`/`e2m1`（框架内没有 BF16 KV cache 这个选项），
-indexer 无条件调用 `deep_gemm.fp8_fp4_*`。
-
-**→ 非 950 的昇腾卡只能走 INT8 W8A8 / W4A8 重量化**，与 vLLM-Ascend 在 A2/A3 上的既定做法一致。
-
-## kernel DSL：tilelang 路线在 910C 上不通（已在 CANN 9.2 上定论）
-
-tilelang 的 arch 是环境变量可配的，950 只是默认值：
-
-```python
-# tilelang/contrib/bisheng.py
-def get_npu_arch(npu_arch: str | None = None) -> str:
-    return npu_arch or os.environ.get("ASCEND_NPU_ARCH", "dav-3510")
-```
-
-用官方算例 `examples/ascend/example_vecadd.py`，在 **CANN 9.2.0 + tilelang 0.1.15** 下，
-每个组合独立进程（避开 tilelang 的进程内存缓存），并拦截 `bisheng.compile_ascend`
-验证实际传入的 arch：
-
-| 组合 | 实际 arch | 结果 |
-|---|---|---|
-| SimtVF `dav-3510` | `dav-3510` | ✅ 编译通过 |
-| SimdVF `dav-3510` | `dav-3510` | ✅ 编译通过 |
-| **SimtVF `dav-2201`** | `dav-2201` | ❌ 失败 |
-| **SimdVF `dav-2201`** | `dav-2201` | ❌ 失败 |
-
-编译器诊断（华为自己的头文件与 bisheng）：
+## 仓库结构
 
 ```
-asc/include/simt_api/math_functions.h:22: error:
-    attribute __simd_callee__/__simt_callee__/__simd_vf__/__simt_vf__ is not [supported]
-asc/include/simt_api/device_functions.h:132: error: unknown type name 'long2'
-bisheng: error: __simt_vf__ is not supported in function: asc_syncthreads
-    on current architecture
+patches/      针对上游的 bring-up 补丁序列（含 BASE_COMMIT 与「为什么不提上游」的说明）
+docs/
+  findings.md       实测结论全集，每条附复核手段
+  platform-910c.md  Ascend910_9382 平台事实、两套 arch 命名的坑、规格对照
+tools/        产出上述结论的探测脚本（路径均 env 参数化，可直接复跑）
+  vendor_stubs/     记账式 vendor 占位模块
+reference/    CANN 对本机的权威描述原文（platform_config INI）
 ```
 
-**→ VF（vector function）编程模型在 arch 2201 上不支持，是代际差异而非 CANN 版本问题。**
-CANN 9.2 已是最新版：950 两种模式都编得过，910C 两种模式都编不过。
+## 快速开始
 
-DeepInfer 的 `tilelang_ops/asc/` 共 30 个文件，其中 **24 个**使用
-`T.SimdVF`（66 处）/ `T.SimtVF`（43 处）。
-**kernel 层对 910C 需要用 Ascend C（非 VF）重写，而不是适配。**
+### 复核平台事实
 
-### 可行路线
+```bash
+bash tools/collect_platform_facts.sh      # 内核 / NPU 占用 / CANN / ACL_HOST_REG_* 枚举值
+python3 tools/probe_soc_version.py        # 不依赖 torch 拿 SoC 版本的两条路径对比
+bash tools/probe_fp8_gating.sh            # FP8 门控与 2201 的支持情况
+bash tools/probe_bisheng_arch.sh          # bisheng 到底接受哪些 --npu-arch
+```
 
-| 路线 | 状态 |
-|---|---|
-| tilelang + 现有 DeepInfer kernel | ❌ VF 模型 2201 不支持 |
-| Ascend C 手写（如 DeepSelect 的实现方式，非 VF） | 可行，但等于重写 30 个 kernel |
-| DeepInfer 引擎层（调度器 / sampler / 异步调度 / 结构化输出） | 平台无关，可直接复用 |
-| kernel 与通信层 | 需整体替换（HCCL `MoeDistributeDispatch*` 取代 DeepEP-Ascend 的 UB 路径） |
+### 复核 tilelang 结论
 
-## 已定位、可直接修正的点
+```bash
+CANN_PREFIX=/opt/cann-9.2 bash tools/probe_tilelang_arch.sh
+```
 
-| 位置 | 上游现状 | 应改为 |
-|---|---|---|
-| `deep_cluster/hardware/device.py` `get_bf16_tflops_limit()` | 硬编码 `432` | 按 soc 查 platform_config。432 = 32 核 × 16×16×16 MAC × 2 FLOP × 1.65 GHz（950）；910C 同式得 **354** |
-| `deep_cluster/hardware/ascend.py` 设备发现 | 首选 `/sys/class/ubcore` + `ub_totalues`（UnifiedBus，950 特性） | 无 ubcore 的卡落 `/dev/davinci*` 回退路径 |
-| 同上 `device_numa_node()` | 回退路径拿到 numa=-1 后直接 `raise RuntimeError` | 按一卡多 die 拓扑重做映射 |
-| `deepinfer/platform.py` `_resolve_acl_host_register_api()` | 符号缺失直接 `RuntimeError` | 基类 `pin_host_memory` 本就是 no-op，应降级而非硬失败 |
-| `deepinfer/platform.py` `TORCH_NPU_DEVICE_CAPABILITY="9.0"` | 注释自称 "hack it temporarily" | 按 soc 给值 |
-| `requirements-ascend.txt` | `torch-npu==2.13.0rc1` + CANN 9.2 | A2/A3 的官方配套上限是 CANN 9.1.X + `torch-npu 2.12.0.post2` |
+一个组合一个独立进程，并拦截 `bisheng.compile_ascend` 验证实际传入的 arch ——
+**不这么做会被 tilelang 的进程内存缓存骗过去**（我们被骗过一次，见 findings 第 2 节）。
 
-### host pin 在 910C 上是静默空操作
+### 应用补丁并跑 bring-up
 
-按 `deepinfer/shared_memory.py` 的真实路径（POSIX shm + `torch.from_numpy` + `pin_host_memory`）
-在 910C 实测，2 GiB buffer、写满真实页、每项 5 轮，H2D 中位带宽：
+```bash
+git clone https://github.com/deepseek-ai/DeepInfer && cd DeepInfer
+git checkout "$(cat ../patches/BASE_COMMIT)"
+git am ../patches/*.patch
+DEEPINFER_ACCELERATOR=ascend bash ./build.sh        # 或 scripts/build.sh build
 
-| 模式 | GB/s |
-|---|---|
-| `torch pin_memory=True`（参照） | **59.3** |
-| `aclrtMallocHost`（参照） | **59.3** |
-| shm 未 pin | 15.8 |
-| shm + `ACL_HOST_REG_PINNED`（上游现状） | 17.1 |
-| shm + `ACL_HOST_REG_MAPPED` | 24.0 |
+# 极小配置 + 随机权重（load_format=dummy），不需要 510 GB 的真权重
+python3 ../tools/make_tiny_model.py --out /tmp/tinymodel --layers 6 --experts 8
 
-`aclrtHostRegisterV2` 返回 0、`is_pinned()` 翻 `True`，但带宽只有真锁页内存的四成 ——
-且因为 `is_pinned()` 为真，`non_blocking=True` 的拷贝会被当作真异步发出。
-换 flag 解决不了（两者都远低于 59.3）；方向是 shm 能否改用 `aclrtMallocHost`，
-涉及跨进程共享语义，非一行改动。
+# vendor 包在 A2/A3 上装不出来，用记账式占位让 import 通过
+DEEPINFER_SRC=$PWD PYTHONPATH=../tools/vendor_stubs python3 ../tools/probe_import_chain.py
+DEEPINFER_SRC=$PWD TINY_MODEL=/tmp/tinymodel PYTHONPATH=../tools/vendor_stubs \
+  DI_STUB_NOOP=deep_gemm.use_deterministic_algorithms \
+  python3 ../tools/run_first_token.py
+```
 
-## 关系与分工
+占位模块会把**被真正调用**的 vendor 函数记进 `DI_STUB_LOG`（默认 `/tmp/di_vendor_calls.txt`）。
+跑到模型层为止只有 2 个被真正调用 —— 这份日志就是待实现清单。
+
+## 下一步
+
+实现 V4.1 模型层的 BF16/INT8 变体。`torch_npu 2.7.1.post8` 的 329 个 `npu_*` 融合算子
+几乎正面覆盖所需（含 `npu_quant_lightning_indexer`、`npu_moe_distribute_dispatch_v2`、
+`npu_grouped_matmul_swiglu_quant`），映射表见 [findings 第 7 节](docs/findings.md)。
+扩展点是上游自己设计好的：`tilelang_ops/ops.py` 按 `PLATFORM.tilelang_ops_backend`
+选后端目录。
+
+## 关系
 
 - **上游**：[deepseek-ai/DeepInfer](https://github.com/deepseek-ai/DeepInfer)（Apache-2.0）
-- **通用修正**（设备发现回退、硬编码常量、硬失败降级）走 fork
-  [lucifer-holly/DeepInfer](https://github.com/lucifer-holly/DeepInfer) 的分支，向上游提 PR
-- **昇腾型号专有的实现**留在本仓库
-- 上游已有一份方向相同的 draft RFC（deepseek-ai/DeepInfer#46，纯文档、无实现）
+- **通用修正**走 fork [lucifer-holly/DeepInfer](https://github.com/lucifer-holly/DeepInfer)
+  的分支向上游提 PR；**型号专有实现**留本仓库
+- 上游另有一份方向相同的 draft RFC：deepseek-ai/DeepInfer#46（纯文档、无实现）
 
 ## License
 

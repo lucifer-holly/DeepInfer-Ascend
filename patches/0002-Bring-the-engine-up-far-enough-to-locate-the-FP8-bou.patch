@@ -1,0 +1,161 @@
+From da8250f37ddd3e9e0ea048f00166b54fe9d9b0a8 Mon Sep 17 00:00:00 2001
+From: Holly <lee.j71@northeastern.edu>
+Date: Wed, 21 Oct 2026 15:34:06 +0800
+Subject: [PATCH 2/2] Bring the engine up far enough to locate the FP8 boundary
+ on 910C
+
+Four changes, each pinned to a concrete failure observed on Ascend910_9382
+(NpuArch 2201, CANN 9.0.1, torch_npu 2.7.1.post8):
+
+- worker/base.py: guard torch._C._accelerator_setAllocatorSettings and
+  torch.compiler.config.force_cudagraph_gc, neither of which exists before
+  torch 2.13. On Ascend the allocator knob is already applied through
+  PYTORCH_NPU_ALLOC_CONF in PlatformNPU.__init__.
+
+- hugging_face/config.py: only enforce the MXFP8+MXFP4 layout keys when the
+  checkpoint is actually quantized. Previously any checkpoint that was not
+  exactly the released V4.1-Flash quantization was rejected, which leaves no
+  way to build on a device without native FP8.
+
+- models/deepseek.py: materialize FP8 parameters as BF16 on non-GPU platforms.
+  aclnn has no DT_FLOAT8_E4M3FN support at all -- it rejects the dtype even
+  for zero_() -- so torch.zeros on an FP8 parameter fails with 161002.
+
+- v4_modules/mla_attn.py: drop the unconditional `assert cfg.fp8_attn`. attn.py
+  already branches on that flag for the norm conversion, so the module is at
+  least constructible without FP8.
+
+With these, the engine reaches model module construction and stops at
+v4_modules/attn.py::_init_wv_o_proj, which reads Wv.weight.sf and calls
+deep_gemm.transform_sf_into_required_layout unconditionally -- the attention
+implementation has no BF16 path. Getting past that is a model-layer rewrite,
+not a bring-up fix, so it is left here deliberately.
+
+Not for upstream: these are 910C bring-up scaffolding on top of the GCC 11
+std::format fallback, and upstream supports exactly one quantized checkpoint
+by design.
+
+(cherry picked from commit d35b10082a7a000293860e147c4293dc7851ef20)
+---
+ deepinfer/hugging_face/config.py              | 28 +++++++++++--------
+ deepinfer/model_executor/models/deepseek.py   | 14 ++++++++--
+ .../models/v4_modules/mla_attn.py             |  6 +++-
+ deepinfer/worker/base.py                      |  8 ++++--
+ 4 files changed, 40 insertions(+), 16 deletions(-)
+
+diff --git a/deepinfer/hugging_face/config.py b/deepinfer/hugging_face/config.py
+index 7cd6f46..c6643a7 100644
+--- a/deepinfer/hugging_face/config.py
++++ b/deepinfer/hugging_face/config.py
+@@ -251,17 +251,23 @@ def load_hf_model_config(path: str | Path) -> AttrDict:
+     _assert_supported(hf)
+ 
+     quant = hf["quantization_config"]
+-    for key, expected in {
+-        "quant_method": "fp8",
+-        "expert_dtype": "fp4",
+-        "activation_scheme": "dynamic",
+-        "weight_block_size": [32, 32],
+-        "scale_fmt": "ue8m0",
+-    }.items():
+-        if quant[key] != expected:
+-            raise ValueError(f"Unsupported HF {key}: {quant[key]!r}; expected {expected!r}")
+-    fp8 = quant["quant_method"] == "fp8"
+-    mxfp4 = quant["expert_dtype"] == "fp4"
++    fp8 = quant.get("quant_method") == "fp8"
++    mxfp4 = quant.get("expert_dtype") == "fp4"
++    if fp8 or mxfp4:
++        # The released V4.1-Flash checkpoint is MXFP8 attention + MXFP4 experts and its
++        # layout knobs are fixed, so validate them whenever the checkpoint is quantized.
++        # An unquantized checkpoint is accepted as well: Ascend NpuArch 2201 (A2/A3) has
++        # no native FP8 at all -- aclnn rejects DT_FLOAT8_E4M3FN even for zero_() -- so
++        # a BF16 checkpoint is the only thing that can be materialized there.
++        for key, expected in {
++            "quant_method": "fp8",
++            "expert_dtype": "fp4",
++            "activation_scheme": "dynamic",
++            "weight_block_size": [32, 32],
++            "scale_fmt": "ue8m0",
++        }.items():
++            if quant[key] != expected:
++                raise ValueError(f"Unsupported HF {key}: {quant[key]!r}; expected {expected!r}")
+ 
+     n_layer = text["num_hidden_layers"]
+     nextn = text.get("num_nextn_predict_layers", 0)
+diff --git a/deepinfer/model_executor/models/deepseek.py b/deepinfer/model_executor/models/deepseek.py
+index ca31b1c..61f6226 100644
+--- a/deepinfer/model_executor/models/deepseek.py
++++ b/deepinfer/model_executor/models/deepseek.py
+@@ -8,7 +8,7 @@ import tile_kernels
+ import torch
+ from torch import nn
+ 
+-from deepinfer import AttrDict, envs
++from deepinfer import PLATFORM, AttrDict, envs
+ from deepinfer.engine.engine_type import EngineType
+ from deepinfer.logger import init_logger
+ from deepinfer.model_executor import eplb
+@@ -248,6 +248,10 @@ class DeepseekModel(nn.Module):
+         )
+ 
+ 
++# 910C bring-up: parameters whose dtype the device cannot materialize, dequantized to BF16.
++_NO_NATIVE_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
++_DEQUANTIZED_PARAMS: dict[str, str] = {}
++
+ class DeepseekForCausalLM(nn.Module):
+     def __init__(
+         self,
+@@ -486,7 +490,13 @@ class DeepseekForCausalLM(nn.Module):
+                 elif not skip_load:
+                     materialized_p = materialize_hf_parameter(p, device=device, packed_fp4=packed_fp4)
+                 else:
+-                    materialized_p = torch.nn.Parameter(torch.zeros(p.shape, dtype=p.dtype, device=device), requires_grad=False)
++                    dummy_dtype = p.dtype
++                    if dummy_dtype in _NO_NATIVE_FP8_DTYPES and not PLATFORM.is_gpu:
++                        # 910C bring-up: NpuArch 2201 (A2/A3) has no native FP8 -- aclnn
++                        # rejects DT_FLOAT8_E4M3FN even for zero_() -- so materialize BF16.
++                        _DEQUANTIZED_PARAMS[f"{nm}.{pn}"] = str(dummy_dtype)
++                        dummy_dtype = torch.bfloat16
++                    materialized_p = torch.nn.Parameter(torch.zeros(p.shape, dtype=dummy_dtype, device=device), requires_grad=False)
+                     if hasattr(p, "sf"):
+                         materialized_p.sf = torch.ones(*(p.sf.shape), device="cuda", dtype=torch.float32)
+                     init_dummy_weight(materialized_p, model_cfg.gpt.mxfp4)
+diff --git a/deepinfer/model_executor/models/v4_modules/mla_attn.py b/deepinfer/model_executor/models/v4_modules/mla_attn.py
+index 90b66bb..7c1fe48 100644
+--- a/deepinfer/model_executor/models/v4_modules/mla_attn.py
++++ b/deepinfer/model_executor/models/v4_modules/mla_attn.py
+@@ -193,7 +193,11 @@ class LoraRopeCompressFlashMHAAutoRecomp(nn.Module):
+         assert cfg.rope_interleaved
+         assert not cfg.use_q_norm_weight
+         assert not cfg.attention_bias
+-        assert cfg.fp8_attn
++        # 910C bring-up: upstream only validated this module with FP8 attention.
++        # attn.py:105 already branches on cfg.fp8_attn for the norm conversion, so a
++        # BF16 build is at least constructible; the forward path is a separate问题.
++        # NpuArch 2201 has no native FP8 (aclnn rejects DT_FLOAT8_E4M3FN outright).
++        # assert cfg.fp8_attn
+ 
+         self.Wq = ColumnParallelLora(
+             cfg.hidden_size,
+diff --git a/deepinfer/worker/base.py b/deepinfer/worker/base.py
+index 158e26a..64e32e6 100644
+--- a/deepinfer/worker/base.py
++++ b/deepinfer/worker/base.py
+@@ -174,10 +174,14 @@ class WorkerBase:
+     def _init_torch(self) -> None:
+         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+-        torch._C._accelerator_setAllocatorSettings("expandable_segments:True")
++        # torch < 2.13 has no accelerator-agnostic allocator setter. On Ascend the same
++        # knob is already applied via PYTORCH_NPU_ALLOC_CONF in PlatformNPU.__init__.
++        if hasattr(torch._C, "_accelerator_setAllocatorSettings"):
++            torch._C._accelerator_setAllocatorSettings("expandable_segments:True")
+         torch.set_num_threads(8)
+         torch.set_num_interop_threads(8)
+-        torch.compiler.config.force_cudagraph_gc = False
++        if hasattr(torch.compiler.config, "force_cudagraph_gc"):
++            torch.compiler.config.force_cudagraph_gc = False
+ 
+     def init_model(self) -> None:
+         configure_worker_environment()

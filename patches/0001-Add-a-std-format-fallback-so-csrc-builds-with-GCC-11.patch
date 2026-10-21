@@ -1,0 +1,215 @@
+From 0b95c36f74bd4b32656760eca5ac31d5fc538542 Mon Sep 17 00:00:00 2001
+From: Holly <lee.j71@northeastern.edu>
+Date: Wed, 21 Oct 2026 15:00:45 +0800
+Subject: [PATCH 1/2] Add a std::format fallback so csrc builds with GCC 11
+
+The Ascend A3 training image ships GCC 11 only, has no network, and no
+g++-13 in its apt sources, so <format> (GCC 13+) is unavailable. csrc uses
+std::format in five places, all with bare {} placeholders and no format
+specs, so a small fallback covers them.
+
+format_string is aliased through type_identity_t to keep Args a non-deduced
+context, matching libstdc++; without that every log::write call site fails
+to deduce Args from the format-string literal.
+
+This is a toolchain workaround for the 910C container, not intended for
+upstream -- the README requires GCC >= 13.
+
+(cherry picked from commit d9db5d2e8490a10f07c004b064aa81c5bc6480ac)
+---
+ csrc/engine/scheduler.hpp    |   7 ++-
+ csrc/utils/format_compat.hpp | 112 +++++++++++++++++++++++++++++++++++
+ csrc/utils/log.hpp           |   7 ++-
+ 3 files changed, 120 insertions(+), 6 deletions(-)
+ create mode 100644 csrc/utils/format_compat.hpp
+
+diff --git a/csrc/engine/scheduler.hpp b/csrc/engine/scheduler.hpp
+index ed6e897..36e3536 100644
+--- a/csrc/engine/scheduler.hpp
++++ b/csrc/engine/scheduler.hpp
+@@ -21,6 +21,7 @@
+ #include <sys/time.h>
+ #include <unistd.h>
+ 
++#include "utils/format_compat.hpp"
+ #include "../cuda_utils.hpp"
+ #include "../utils/object_pool.hpp"
+ #include "block_manager.hpp"
+@@ -118,7 +119,7 @@ struct Scheduler {
+         nextn = std::max(0, get_nextn_from_env());
+ 
+         TORCH_CHECK(prefill_max_sum_seqlen_k >= prompt_limit,
+-            std::format("prefill_max_sum_seqlen_k={} too small, prompt_limit={}", prefill_max_sum_seqlen_k, prompt_limit));
++            ::deepinfer::fmtcompat::format("prefill_max_sum_seqlen_k={} too small, prompt_limit={}", prefill_max_sum_seqlen_k, prompt_limit));
+ 
+         running.reserve(max_num_seqs);
+         free_mtp_info_slots.reserve(max_num_seqs);
+@@ -492,7 +493,7 @@ struct Scheduler {
+                 seqlen_q = new_seqlen_q;
+             }
+             if (seqlen_q == 0) {
+-                TORCH_CHECK(!scheduled.empty(), std::format("有请求正在排队，但是调度不上来，不应该 (post_adjust)"
++                TORCH_CHECK(!scheduled.empty(), ::deepinfer::fmtcompat::format("有请求正在排队，但是调度不上来，不应该 (post_adjust)"
+                                                             ", len={}, cached={}, seq_workload={}, new_workload={}"
+                                                             ", num_batched_tokens={}, max_num_batched_tokens={}"
+                                                             ", cp_align={}, branch_id={}",
+@@ -699,7 +700,7 @@ struct Scheduler {
+             // max_k），DFlash draft 再往后 nextn。RoPE cache 等按 position 索引的 buffer 都只有 runtime_max_model_len 行。
+             int position_end = scheduler_outputs.prompt_run ? seqlen_k : seqlen_k - seqlen_q + max_seqlen_q + nextn;
+             TORCH_CHECK(position_end <= runtime_max_model_len,
+-                std::format("position_end={} exceeds runtime_max_model_len={}: request_id={} branch={} len={} num_tokens={} inflight={} "
++                ::deepinfer::fmtcompat::format("position_end={} exceeds runtime_max_model_len={}: request_id={} branch={} len={} num_tokens={} inflight={} "
+                             "seqlen_q={} prompt_run={}",
+                     position_end, runtime_max_model_len, seq->request.request_id, seq->schedule.branch_id, seq->get_len(),
+                     seq->cache.num_tokens, seq->schedule.total_inflight_tokens, seqlen_q, scheduler_outputs.prompt_run));
+diff --git a/csrc/utils/format_compat.hpp b/csrc/utils/format_compat.hpp
+new file mode 100644
+index 0000000..cbf989c
+--- /dev/null
++++ b/csrc/utils/format_compat.hpp
+@@ -0,0 +1,112 @@
++#pragma once
++
++// ⚠️ 工具链回退，不是上游要的改动。
++//
++// 上游 README 要求 GCC >= 13（`<format>` 从 GCC 13 才进 libstdc++）。
++// 昇腾 A3 的官方训练镜像（Ubuntu 22.04）只带 GCC 11，容器内无网络、apt 源里也没有
++// g++-13，无法就地升级编译器。为了先把引擎在 910C 上编起来，这里提供一个
++// **只支持 `{}` 占位符**的最小回退实现。
++//
++// csrc 里 `std::format` 的全部调用点（log.hpp 与 engine/scheduler.hpp）用的都是裸 `{}`，
++// 没有 `{:spec}` 这类格式说明符，所以这个回退足够。
++// 有 `<format>` 时直接转发给标准库，行为完全一致。
++
++#include <sstream>
++#include <string>
++#include <string_view>
++#include <type_traits>
++#include <utility>
++
++#if defined(__has_include)
++#if __has_include(<format>)
++#define DEEPINFER_HAS_STD_FORMAT 1
++#endif
++#endif
++
++#ifdef DEEPINFER_HAS_STD_FORMAT
++#include <format>
++#endif
++
++namespace deepinfer::fmtcompat {
++
++#ifdef DEEPINFER_HAS_STD_FORMAT
++
++template <typename... Args> using format_string = std::format_string<Args...>;
++
++template <typename... Args> inline std::string format(format_string<Args...> f, Args &&...args) {
++    return std::format(f, std::forward<Args>(args)...);
++}
++
++#else
++
++/// `std::format_string` 的替身：只保存格式串，不做编译期校验。
++/// 模板参数仅为与 `std::format_string<Args...>` 的用法对齐，实现里不使用。
++template <typename...> struct basic_format_string {
++    std::string_view sv;
++    basic_format_string(const char *s) : sv(s) {}           // NOLINT(google-explicit-constructor)
++    basic_format_string(const std::string &s) : sv(s) {}    // NOLINT(google-explicit-constructor)
++    basic_format_string(std::string_view s) : sv(s) {}      // NOLINT(google-explicit-constructor)
++};
++
++/// `type_identity_t` 让 `Args` 成为**非推导上下文** —— 和 libstdc++ 对
++/// `std::format_string` 的做法一致。少了这一层，编译器会试图从格式串字面量
++/// （`const char[N]`）去推 `Args`，于是 `log::write(...)` 的每个调用点都报
++/// "no matching function for call to write(...)"。
++template <typename... Args> using format_string = basic_format_string<std::type_identity_t<Args>...>;
++
++namespace detail {
++
++/// 复制剩余的格式串；`{{` / `}}` 按标准语义转义成单个花括号。
++inline void fill(std::ostringstream &os, std::string_view f) {
++    for (std::size_t i = 0; i < f.size(); i++) {
++        if (i + 1 < f.size() && (f[i] == '{' || f[i] == '}') && f[i + 1] == f[i]) {
++            os << f[i];
++            i++;
++        } else {
++            os << f[i];
++        }
++    }
++}
++
++/// 遇到第一个 `{...}` 就替换成 `v`，其余参数递归处理。
++/// 占位符内的说明符（如果有）被忽略 —— 本仓库的调用点都是裸 `{}`。
++template <typename T, typename... Rest> void fill(std::ostringstream &os, std::string_view f, T &&v, Rest &&...rest) {
++    for (std::size_t i = 0; i < f.size(); i++) {
++        if (i + 1 < f.size() && (f[i] == '{' || f[i] == '}') && f[i + 1] == f[i]) {
++            os << f[i];
++            i++;
++            continue;
++        }
++        if (f[i] == '{') {
++            const std::size_t close = f.find('}', i);
++            os << std::forward<T>(v);
++            if (close == std::string_view::npos) {
++                return; // 格式串不完整，截断在这里，不抛异常（日志路径不应因此崩）
++            }
++            fill(os, f.substr(close + 1), std::forward<Rest>(rest)...);
++            return;
++        }
++        os << f[i];
++    }
++    // 参数多于占位符：与 std::format 不同，这里静默忽略而不是编译期报错
++}
++
++template <typename F> inline std::string_view to_sv(const F &f) {
++    if constexpr (std::is_convertible_v<const F &, std::string_view>) {
++        return std::string_view(f);
++    } else {
++        return f.sv; // format_string<...>
++    }
++}
++
++} // namespace detail
++
++template <typename F, typename... Args> inline std::string format(const F &f, Args &&...args) {
++    std::ostringstream os;
++    detail::fill(os, detail::to_sv(f), std::forward<Args>(args)...);
++    return os.str();
++}
++
++#endif // DEEPINFER_HAS_STD_FORMAT
++
++} // namespace deepinfer::fmtcompat
+diff --git a/csrc/utils/log.hpp b/csrc/utils/log.hpp
+index aabe178..a258bd4 100644
+--- a/csrc/utils/log.hpp
++++ b/csrc/utils/log.hpp
+@@ -4,12 +4,13 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <ctime>
+-#include <format>
+ #include <mutex>
+ #include <string>
+ #include <string_view>
+ #include <utility>
+ 
++#include "utils/format_compat.hpp"
++
+ namespace deepinfer::log {
+ 
+ enum class Level { OFF, ERROR, WARN, INFO, NUM_LEVELS };
+@@ -44,11 +45,11 @@ inline std::string timestamp() {
+     return std::string(buf, n);
+ }
+ 
+-template <typename... Args> inline void write(Level lv, const char *file, int line, std::format_string<Args...> f, Args &&...args) {
++template <typename... Args> inline void write(Level lv, const char *file, int line, ::deepinfer::fmtcompat::format_string<Args...> f, Args &&...args) {
+     if (lv > level()) {
+         return;
+     }
+-    std::string body = std::format(f, std::forward<Args>(args)...);
++    std::string body = ::deepinfer::fmtcompat::format(f, std::forward<Args>(args)...);
+     std::lock_guard lock(mutex);
+     std::fprintf(stdout, "[%s %s %s:%u] %s\n", level_name(lv), timestamp().c_str(), file, line, body.c_str());
+     std::fflush(stdout);
