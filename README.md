@@ -67,9 +67,9 @@ indexer 无条件调用 `deep_gemm.fp8_fp4_*`。
 
 **→ 非 950 的昇腾卡只能走 INT8 W8A8 / W4A8 重量化**，与 vLLM-Ascend 在 A2/A3 上的既定做法一致。
 
-## kernel DSL 现状（910C 实测，CANN 9.0.1 + tilelang 0.1.15）
+## kernel DSL：tilelang 路线在 910C 上不通（已在 CANN 9.2 上定论）
 
-tilelang 的 arch 是环境变量可配的，950 只是默认值 —— 不是写死：
+tilelang 的 arch 是环境变量可配的，950 只是默认值：
 
 ```python
 # tilelang/contrib/bisheng.py
@@ -77,17 +77,42 @@ def get_npu_arch(npu_arch: str | None = None) -> str:
     return npu_arch or os.environ.get("ASCEND_NPU_ARCH", "dav-3510")
 ```
 
-用官方算例 `examples/ascend/example_vecadd.py` 跑
-{simt, simd} × {`dav-3510`, `dav-2201`} × {tile 2048, 8192}，8/8 编译失败，
-但**是两种本质不同的失败**：
+用官方算例 `examples/ascend/example_vecadd.py`，在 **CANN 9.2.0 + tilelang 0.1.15** 下，
+每个组合独立进程（避开 tilelang 的进程内存缓存），并拦截 `bisheng.compile_ascend`
+验证实际传入的 arch：
 
-| arch | 失败位置 | 性质 |
+| 组合 | 实际 arch | 结果 |
 |---|---|---|
-| `dav-3510` | tilelang 的 `simd_inst.h`：`asc_loadalign` 无匹配重载、`asc_pack_to_high` 未声明、`asc_load_l2_cache_mode` 未知类型 | CANN 版本不够（tilelang 0.1.15 需要 9.2） |
-| `dav-2201` | **CANN 自己的** `tikcpp/tikcfw/interface/simt_api/device_functions.h`：`long2` / `ulong2` / `long4` / `ulonglong2` / `char2` 未定义 | 这些向量类型在 arch 2201 下不存在 |
+| SimtVF `dav-3510` | `dav-3510` | ✅ 编译通过 |
+| SimdVF `dav-3510` | `dav-3510` | ✅ 编译通过 |
+| **SimtVF `dav-2201`** | `dav-2201` | ❌ 失败 |
+| **SimdVF `dav-2201`** | `dav-2201` | ❌ 失败 |
 
-**尚未回答**：CANN 9.2 是否会为 2201 补上这些向量类型。
-这决定 tilelang 路线在非 950 昇腾卡上是否可行，需要 CANN 9.2 环境才能验证。
+编译器诊断（华为自己的头文件与 bisheng）：
+
+```
+asc/include/simt_api/math_functions.h:22: error:
+    attribute __simd_callee__/__simt_callee__/__simd_vf__/__simt_vf__ is not [supported]
+asc/include/simt_api/device_functions.h:132: error: unknown type name 'long2'
+bisheng: error: __simt_vf__ is not supported in function: asc_syncthreads
+    on current architecture
+```
+
+**→ VF（vector function）编程模型在 arch 2201 上不支持，是代际差异而非 CANN 版本问题。**
+CANN 9.2 已是最新版：950 两种模式都编得过，910C 两种模式都编不过。
+
+DeepInfer 的 `tilelang_ops/asc/` 共 30 个文件，其中 **24 个**使用
+`T.SimdVF`（66 处）/ `T.SimtVF`（43 处）。
+**kernel 层对 910C 需要用 Ascend C（非 VF）重写，而不是适配。**
+
+### 可行路线
+
+| 路线 | 状态 |
+|---|---|
+| tilelang + 现有 DeepInfer kernel | ❌ VF 模型 2201 不支持 |
+| Ascend C 手写（如 DeepSelect 的实现方式，非 VF） | 可行，但等于重写 30 个 kernel |
+| DeepInfer 引擎层（调度器 / sampler / 异步调度 / 结构化输出） | 平台无关，可直接复用 |
+| kernel 与通信层 | 需整体替换（HCCL `MoeDistributeDispatch*` 取代 DeepEP-Ascend 的 UB 路径） |
 
 ## 已定位、可直接修正的点
 
