@@ -39,4 +39,19 @@ PYTHONPATH=tools/vendor_stubs DI_STUB_LOG=/tmp/vendor.txt python3 ...
 这份日志就是待实现清单，比 `grep` 准得多：跑到模型层为止，
 **被真正调用的只有 2 个**，而 `grep` 能数出几十处引用。
 
+- `IMPL` —— 由 shim 提供**真实的最小实现**（非 kernel 的全局簿记，如分组 GEMM 连续布局的
+  对齐粒度）。这类接口不参与计算，照搬语义即可，所以不是假装
+
 `DI_STUB_NOOP` 的名单本身也是产出 —— 它记录了「为了推进下去必须假装成功的东西」。
+
+## 🔴 2026-11-10 修了一个会误导人的 bug
+
+`_record()` 原本**按 qualname 去重**。取属性一定先于调用发生，于是一个名字只要先以
+`ATTR` 记过，它的 `CALL` / `IMPL` / `NOOP` 就全被吞掉 —— **日志里 CALL 永远是 0**。
+
+当时 `docs/findings.md` 里「被真正调用的只有 2 个」这个结论是对的，但它是从
+**traceback 里读出来的**，不是这个日志给的；照着跑的人会看到 CALL=0 而以为什么都没被调用。
+
+已改成按 `(kind, qualname)` 去重，四类都记得下。这正是
+[[build-verification-false-positives]] 那条教训的又一个实例：
+**先用一个已知会触发的场景验证判据本身真的会变色，再去信它的输出。**
